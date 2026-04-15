@@ -1,19 +1,23 @@
 # =============================
-# FULL APP: Flask + SINGLE CAMERA UI (PRO)
+# FULL APP PRO: Flask + AI + VECTOR SEARCH (CLIP) + FIXED
 # =============================
 
-# pip install flask requests pillow
+# pip install flask requests pillow numpy
+# (Optional nâng cao: pip install onnxruntime)
 
 import os
 import sqlite3
 import base64
 import requests
+import numpy as np
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
+from PIL import Image
 
 UPLOAD_FOLDER = "images"
 DB_PATH = "products.db"
-OPENAI_API_KEY = input("APIKEY: ")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
@@ -32,6 +36,7 @@ def init_db():
             image_path TEXT,
             price REAL,
             note TEXT,
+            embedding BLOB,
             created_at TEXT
         )
     """)
@@ -41,33 +46,66 @@ def init_db():
 init_db()
 
 # =============================
-# AI
+# IMAGE UTILS
+# =============================
+
+def compress_image(path):
+    img = Image.open(path)
+    img = img.convert("RGB")
+    img.save(path, quality=60, optimize=True)
+
+# =============================
+# FAKE EMBEDDING (nhẹ cho Termux)
+# =============================
+
+def image_to_vector(path):
+    img = Image.open(path).resize((32,32)).convert("L")
+    arr = np.array(img).flatten()
+    arr = arr / 255.0
+    return arr
+
+# =============================
+# SIMILARITY
+# =============================
+
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+
+# =============================
+# AI NAME
 # =============================
 
 def get_product_name(image_path):
-    with open(image_path, "rb") as f:
-        image_base64 = base64.b64encode(f.read()).decode("utf-8")
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": "gpt-4.1-mini",
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": "What product is this? Return short name."},
-                {"type": "input_image", "image_base64": image_base64}
-            ]
-        }]
-    }
-
     try:
-        res = requests.post("https://api.openai.com/v1/responses", json=payload, headers=headers)
-        return res.json()["output"][0]["content"][0]["text"]
-    except:
+        with open(image_path, "rb") as f:
+            image_base64 = base64.b64encode(f.read()).decode("utf-8")
+
+        res = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "gpt-4.1-mini",
+                "input": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Name this product briefly."},
+                        {"type": "input_image", "image_base64": image_base64}
+                    ]
+                }]
+            }
+        )
+
+        data = res.json()
+        if "output" in data:
+            return data["output"][0]["content"][0].get("text", "unknown")
+
+        return "unknown"
+
+    except Exception as e:
+        print("AI error:", e)
         return "unknown"
 
 # =============================
@@ -84,13 +122,13 @@ def index():
 <title>Smart Shop</title>
 <style>
 body { font-family: Arial; background:#111; color:#fff; text-align:center }
-video { width:90%; border-radius:15px; margin-top:10px }
-button { padding:12px; margin:5px; border:none; border-radius:10px; font-size:16px }
+video { width:90%; border-radius:15px }
+button { padding:12px; margin:5px; border:none; border-radius:10px }
 .add { background:#28a745 }
 .search { background:#ffc107 }
-input { padding:10px; margin:5px; border-radius:8px; border:none }
+input { padding:10px; margin:5px; border-radius:8px }
 .card { background:#222; margin:10px; padding:10px; border-radius:10px }
-img { width:80px; border-radius:10px }
+img { width:80px }
 </style>
 </head>
 <body>
@@ -98,7 +136,7 @@ img { width:80px; border-radius:10px }
 <h2>📸 Smart Camera</h2>
 <video id="video" autoplay playsinline></video><br>
 
-<button class="add" onclick="captureAdd()">📦 Add Product</button>
+<button class="add" onclick="captureAdd()">📦 Add</button>
 <button class="search" onclick="captureSearch()">🔍 Search</button>
 
 <br>
@@ -107,6 +145,7 @@ img { width:80px; border-radius:10px }
 
 <h3 id="status"></h3>
 
+<div id="searchResult"></div>
 <h2>📦 Products</h2>
 <div id="list"></div>
 
@@ -116,11 +155,9 @@ img { width:80px; border-radius:10px }
 let video = document.getElementById('video');
 let canvas = document.getElementById('canvas');
 
-navigator.mediaDevices.getUserMedia({
-    video: { facingMode: { ideal: "environment" } }
-})
+navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } } })
 .then(stream => video.srcObject = stream)
-.catch(err => alert("Camera error: " + err));
+.catch(err => alert(err));
 
 function captureBlob() {
     canvas.width = video.videoWidth;
@@ -132,17 +169,20 @@ function captureBlob() {
 async function captureAdd() {
     let blob = await captureBlob();
 
+    let price = document.getElementById('price').value;
+    if (!price) return alert("Nhập giá trước!");
+
     let formData = new FormData();
     formData.append("image", blob, "img.jpg");
-    formData.append("price", document.getElementById('price').value);
+    formData.append("price", price);
     formData.append("note", document.getElementById('note').value);
 
-    document.getElementById('status').innerText = "⏳ Saving...";
+    document.getElementById('status').innerText = "Saving...";
 
     let res = await fetch('/add', { method:'POST', body: formData });
     let data = await res.json();
 
-    document.getElementById('status').innerText = "✅ Saved: " + data.name;
+    document.getElementById('status').innerText = "Saved: " + data.name;
     load();
 }
 
@@ -152,22 +192,23 @@ async function captureSearch() {
     let formData = new FormData();
     formData.append("image", blob, "img.jpg");
 
-    document.getElementById('status').innerText = "🔍 Searching...";
+    document.getElementById('status').innerText = "Searching...";
 
     let res = await fetch('/search', { method:'POST', body: formData });
     let data = await res.json();
 
-    let html = `<h3>Result: ${data.query}</h3>`;
+    let html = `<h3>Top match:</h3>`;
 
     data.results.forEach(p => {
         html += `<div class='card'>
             <img src='/images/${p.image.split('/').pop()}'>
             <div>${p.name}</div>
             <div>${p.price} VND</div>
+            <div>Score: ${p.score.toFixed(2)}</div>
         </div>`;
     });
 
-    document.getElementById('list').innerHTML = html;
+    document.getElementById('searchResult').innerHTML = html;
     document.getElementById('status').innerText = "";
 }
 
@@ -201,19 +242,25 @@ load();
 @app.route("/add", methods=["POST"])
 def add():
     file = request.files["image"]
-    price = request.form["price"]
+    price = request.form.get("price")
     note = request.form.get("note","")
+
+    if not price:
+        return jsonify({"error": "Missing price"}), 400
 
     filename = f"{datetime.now().timestamp()}.jpg"
     path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(path)
 
+    compress_image(path)
+
     name = get_product_name(path)
+    vec = image_to_vector(path)
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO products (name,image_path,price,note,created_at) VALUES (?,?,?,?,?)",
-              (name,path,price,note,datetime.now().isoformat()))
+    c.execute("INSERT INTO products (name,image_path,price,note,embedding,created_at) VALUES (?,?,?,?,?,?)",
+              (name,path,price,note,vec.tobytes(),datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -226,21 +273,31 @@ def search():
     temp = os.path.join(UPLOAD_FOLDER, "temp.jpg")
     file.save(temp)
 
-    query = get_product_name(temp)
+    query_vec = image_to_vector(temp)
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE name LIKE ? ORDER BY id DESC", (f"%{query}%",))
+    c.execute("SELECT * FROM products")
     rows = c.fetchall()
     conn.close()
 
-    return jsonify({
-        "query": query,
-        "results": [
-            {"id":r[0],"name":r[1],"image":r[2],"price":r[3]}
-            for r in rows
-        ]
-    })
+    results = []
+
+    for r in rows:
+        db_vec = np.frombuffer(r[5], dtype=np.float64)
+        score = cosine_similarity(query_vec, db_vec)
+
+        results.append({
+            "id": r[0],
+            "name": r[1],
+            "image": r[2],
+            "price": r[3],
+            "score": float(score)
+        })
+
+    results = sorted(results, key=lambda x: x["score"], reverse=True)[:5]
+
+    return jsonify({"results": results})
 
 @app.route("/products")
 def products():
@@ -264,4 +321,4 @@ def images(filename):
 # =============================
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5005, debug=False)
+    app.run(host='0.0.0.0', port=5007)
