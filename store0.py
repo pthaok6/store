@@ -1,2 +1,2 @@
 import os
-os.sysem("git pull && python store.py")
+os.system("git pull && python store.py")
