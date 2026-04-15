@@ -13,8 +13,7 @@ from flask import Flask, request, jsonify, render_template_string, send_from_dir
 
 UPLOAD_FOLDER = "images"
 DB_PATH = "products.db"
-OPENAI_API_KEY = "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"
-
+OPENAI_API_KEY = input("APIKEY: ")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app = Flask(__name__)
